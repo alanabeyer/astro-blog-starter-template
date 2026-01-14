@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Met Palette Explorer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 24px; background: #fafafa; }
+    h1 { margin: 0 0 12px; }
+    input, button { padding: 8px 10px; font-size: 14px; }
+    button { cursor: pointer; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    #status { margin-top: 12px; padding: 10px; background:#fff; border:1px solid #ddd; border-radius:10px; }
+    #palette { display: flex; gap: 10px; margin: 18px 0; flex-wrap: wrap; }
+    .swatch { width: 64px; height: 64px; border-radius: 10px; border: 1px solid #ccc; }
+    #results { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 14px; }
+    .card { background:#fff; border:1px solid #eee; border-radius:12px; padding:10px; }
+    .card img { width: 100%; border-radius: 10px; display:block; }
+    .meta { font-size: 12px; color:#333; margin-top: 8px; line-height: 1.25; }
+    .muted { color:#666; }
+  </style>
+</head>
+<body>
+
+<h1>Met Palette Explorer</h1>
+
+<div class="row">
+  <label>Artist
+    <input id="artist" placeholder="Edgar Degas" value="Edgar Degas" />
+  </label>
+
+  <label>Year
+    <input id="year" placeholder="1865" value="1865" />
+  </label>
+
+  <label>Year window (±)
+    <input id="window" placeholder="20" value="20" style="width:70px" />
+  </label>
+
+  <button id="btn">Generate</button>
+</div>
+
+<p class="muted" style="margin-top:10px">
+  Uses The Met API + your Worker proxy for images (so canvas can read pixels).
+</p>
+
+<div id="status">Ready.</div>
+<div id="palette"></div>
+<div id="results"></div>
+
+<script>
+/** ✅ Your Worker proxy base */
+const PROXY_BASE = "https://astro-blog-starter-template.alana-m-beyer.workers.dev/img?url=";
+
+const statusEl = document.getElementById("status");
+const paletteDiv = document.getElementById("palette");
+const resultsDiv = document.getElementById("results");
+document.getElementById("btn").addEventListener("click", run);
+
+function setStatus(msg) {
+  statusEl.textContent = msg;
+}
+
+async function run() {
+  paletteDiv.innerHTML = "";
+  resultsDiv.innerHTML = "";
+
+  const artist = document.getElementById("artist").value.trim();
+  const yearRaw = document.getElementById("year").value.trim();
+  const winRaw = document.getElementById("window").value.trim();
+
+  const year = yearRaw ? Number(yearRaw) : null;
+  const win = winRaw ? Number(winRaw) : 20;
+
+  if (!artist) return setStatus("Enter an artist.");
+  if (yearRaw && Number.isNaN(year)) return setStatus("Year must be a number (or blank).");
+  if (winRaw && Number.isNaN(win)) return setStatus("Window must be a number.");
+
+  try {
+    setStatus("Searching The Met API…");
+
+    const searchUrl =
+      `https://collectionapi.metmuseum.org/public/collection/v1/search?hasImages=true&q=${encodeURIComponent(artist)}`;
+
+    const searchRes = await fetch(searchUrl);
+    if (!searchRes.ok) throw new Error(`Search failed: HTTP ${searchRes.status}`);
+    const searchJson = await searchRes.json();
+
+    const ids = (searchJson.objectIDs || []).slice(0, 60);
+    if (!ids.length) return setStatus("No results found (with images). Try a broader query.");
+
+    setStatus(`Found ${searchJson.total} hits. Fetching details for ${ids.length} objects…`);
+
+    // Fetch object details in parallel
+    const objs = await Promise.all(ids.map(id =>
+      fetch(`https://collectionapi.metmuseum.org/public/collection/v1/objects/${id}`)
+        .then(r => r.ok ? r.json() : null)
+        .catch(() => null)
+    ));
+
+    // Filter
+    const artistLower = artist.toLowerCase();
+    const filtered = objs
+      .filter(o => o && o.primaryImageSmall)
+      .filter(o => (o.artistDisplayName || "").toLowerCase().includes(artistLower))
+      .filter(o => {
+        if (!year) return true;
+        return !(o.objectBeginDate > year + win || o.objectEndDate < year - win);
+      })
+      .slice(0, 18); // keep it manageable
+
+    if (!filtered.length) {
+      return setStatus("Nothing matched after filtering by artist + year window. Try blank year or wider window.");
+    }
+
+    setStatus(`Using ${filtered.length} artworks. Loading images through proxy…`);
+
+    let allPixels = [];
+    let loaded = 0;
+
+    for (const obj of filtered) {
+      const proxied = PROXY_BASE + encodeURIComponent(obj.primaryImageSmall);
+
+      // UI card
+      const card = document.createElement("div");
+      card.className = "card";
+
+      const img = new Image();
+      img.crossOrigin = "anonymous"; // safe with proxy + CORS headers
+      img.src = proxied;
+
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.innerHTML = `
+        <div><strong>${escapeHtml(obj.title || "Untitled")}</strong></div>
+        <div class="muted">${escapeHtml(obj.objectDate || "")}</div>
+      `;
+
+      card.appendChild(img);
+      card.appendChild(meta);
+      resultsDiv.appendChild(card);
+
+      await new Promise(resolve => {
+        img.onload = () => resolve();
+        img.onerror = () => resolve();
+      });
+
+      loaded++;
+      setStatus(`Loaded ${loaded}/${filtered.length}. Sampling pixels…`);
+
+      // Sample pixels via canvas
+      const pixels = samplePixels(img);
+      allPixels.push(...pixels);
+    }
+
+    if (!allPixels.length) {
+      return setStatus("Images loaded but no pixels sampled (unexpected).");
+    }
+
+    setStatus(`Clustering ~${allPixels.length.toLocaleString()} samples…`);
+
+    const colors = kMeans(allPixels, 6);
+
+    paletteDiv.innerHTML = "";
+    colors.forEach(c => {
+      const swatch = document.createElement("div");
+      swatch.className = "swatch";
+      swatch.style.backgroundColor = `rgb(${c[0]}, ${c[1]}, ${c[2]})`;
+      swatch.title = rgbToHex(c[0], c[1], c[2]);
+      paletteDiv.appendChild(swatch);
+    });
+
+    setStatus(`Done. Palette computed from ${filtered.length} artworks.`);
+  } catch (err) {
+    console.error(err);
+    setStatus(`Error: ${err.message}`);
+  }
+}
+
+function samplePixels(img) {
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+  const targetW = 200;
+  const scale = targetW / (img.naturalWidth || img.width || 1);
+  const targetH = Math.max(1, Math.round((img.naturalHeight || img.height || 1) * scale));
+
+  canvas.width = targetW;
+  canvas.height = targetH;
+  ctx.drawImage(img, 0, 0, targetW, targetH);
+
+  const data = ctx.getImageData(0, 0, targetW, targetH).data;
+  const out = [];
+
+  // Sample every Nth pixel
+  for (let i = 0; i < data.length; i += 40) {
+    const r = data[i], g = data[i+1], b = data[i+2], a = data[i+3];
+    if (a < 200) continue;
+
+    // Drop extreme near-black/near-white
+    const max = Math.max(r,g,b);
+    const min = Math.min(r,g,b);
+    if (max < 15) continue;
+    if (min > 245) continue;
+
+    out.push([r,g,b]);
+  }
+  return out;
+}
+
+// Tiny k-means (RGB) for MVP
+function kMeans(points, k) {
+  let centroids = [];
+  for (let i = 0; i < k; i++) centroids.push(points[Math.floor(Math.random() * points.length)]);
+
+  for (let iter = 0; iter < 10; iter++) {
+    const clusters = Array.from({ length: k }, () => []);
+    for (const p of points) {
+      let best = 0, min = Infinity;
+      for (let i = 0; i < k; i++) {
+        const d = dist2(p, centroids[i]);
+        if (d < min) { min = d; best = i; }
+      }
+      clusters[best].push(p);
+    }
+    centroids = clusters.map((c, i) => c.length ? avg(c) : centroids[i]);
+  }
+
+  return centroids.map(c => c.map(v => Math.round(v)));
+}
+
+function dist2(a, b) {
+  const dr = a[0]-b[0], dg = a[1]-b[1], db = a[2]-b[2];
+  return dr*dr + dg*dg + db*db;
+}
+
+function avg(arr) {
+  const n = arr.length;
+  let r=0,g=0,b=0;
+  for (const p of arr) { r+=p[0]; g+=p[1]; b+=p[2]; }
+  return [r/n, g/n, b/n];
+}
+
+function rgbToHex(r,g,b) {
+  return "#" + [r,g,b].map(v => v.toString(16).padStart(2,"0")).join("");
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+  }[c]));
+}
+</script>
+
+</body>
+</html>
